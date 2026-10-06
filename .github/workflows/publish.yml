@@ -1,0 +1,85 @@
+name: Publish downloads
+
+# The APK arrives as parts in the "incoming" branch (git refuses files over 100 MB): they're joined and
+# published as the "app" release, and the branch is deleted. The Hebrew speech models are built here
+# from ivrit.ai's model and published as the "models" release.
+on:
+  push:
+    branches: [incoming]
+  workflow_dispatch:
+    inputs:
+      models:
+        description: Rebuild the speech models too
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  app:
+    if: github.ref == 'refs/heads/incoming'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: incoming
+      - name: Publish the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          cat OfflineAssistant.apk.part-* > "Helen-${version}.apk"
+          files=("Helen-${version}.apk")
+          if [ -f OfflineAssistant-lite.apk ]; then
+            mv OfflineAssistant-lite.apk "Helen-${version}-lite.apk"
+            files+=("Helen-${version}-lite.apk")
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          gh release delete app -y --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create app "${files[@]}" SHA256SUMS.txt -R "$GITHUB_REPOSITORY" --target main --latest \
+            --title "הלן – גרסה ${version}" --notes-file NOTES.md
+          git push -q origin --delete incoming
+
+  models:
+    if: github.ref == 'refs/heads/incoming' || inputs.models
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      WHISPER_CPP: v1.9.4
+      SOURCE: https://huggingface.co/ivrit-ai/whisper-large-v3-turbo-ggml/resolve/main/ggml-model.bin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Already published?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.models }}" != "true" ] && gh release view models -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build whisper-quantize (same whisper.cpp version as the app)
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git clone -q --depth 1 --branch "$WHISPER_CPP" https://github.com/ggml-org/whisper.cpp "$RUNNER_TEMP/whisper.cpp"
+          cmake -S "$RUNNER_TEMP/whisper.cpp" -B "$RUNNER_TEMP/wb" -DCMAKE_BUILD_TYPE=Release > /dev/null
+          cmake --build "$RUNNER_TEMP/wb" -j4 --target whisper-quantize > /dev/null
+      - name: Shrink and publish
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/full.bin" "$SOURCE"
+          for q in q5_0 q4_0 q3_k; do
+            "$RUNNER_TEMP/wb/bin/whisper-quantize" "$RUNNER_TEMP/full.bin" "ggml-ivrit-turbo-$q.bin" "$q"
+          done
+          rm "$RUNNER_TEMP/full.bin"
+          sha256sum ggml-ivrit-turbo-*.bin > SHA256SUMS.txt
+          ls -l ggml-ivrit-turbo-*.bin
+          gh release delete models -y --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create models ggml-ivrit-turbo-*.bin SHA256SUMS.txt -R "$GITHUB_REPOSITORY" --target main --latest=false \
+            --title "מודלים לזיהוי דיבור בעברית (ivrit.ai)" --notes-file MODELS.md
